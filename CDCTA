@@ -1,0 +1,291 @@
+import os
+import pickle
+import time
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
+import numpy as np
+import scipy.io as sio
+import scipy.io
+import scipy.linalg
+import torch
+import torch.nn as nn
+from torchsummary import summary
+import scipy
+import dataset1
+import plots
+import transformer1
+import utils
+import torch.nn.functional as F
+
+dtype = torch.FloatTensor
+
+
+class AutoEncoder(nn.Module):
+    def __init__(self, P, L, size, patch, dim):
+        super(AutoEncoder, self).__init__()
+        self.P, self.L, self.size, self.dim = P, L, size, dim
+        self.encoder = nn.Sequential(
+            nn.Conv2d(L, 128, kernel_size=(1, 1), stride=(1, 1), padding=(0, 0)),
+            nn.BatchNorm2d(128, momentum=0.9),
+            nn.Dropout(0.25),
+            nn.LeakyReLU(),
+            nn.Conv2d(128, 64, kernel_size=(1, 1), stride=(1, 1), padding=(0, 0)),
+            nn.BatchNorm2d(64, momentum=0.9),
+            nn.LeakyReLU(),
+            nn.Conv2d(64, (dim*P)//patch**2, kernel_size=(1, 1), stride=(1, 1), padding=(0, 0)),
+            nn.BatchNorm2d((dim*P)//patch**2, momentum=0.5),
+        )
+
+        self.vtrans = transformer1.ViT(image_size=size, patch_size=patch, dim=(dim*P), depth=2,
+                                      heads=8, mlp_dim=12, pool='cls')
+        
+        self.upscale = nn.Sequential(
+            nn.Linear(dim, size ** 2),
+        )
+        
+        self.smooth = nn.Sequential(
+            nn.Conv2d(P, P, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)),
+            nn.Softmax(dim=1),
+        )
+
+        self.decoder1 = nn.Sequential(
+            nn.Conv2d(P, L, kernel_size=(1, 1), stride=(1, 1), bias=False),
+            nn.ReLU(),
+        )
+        self.decoder2 = nn.Sequential(
+            nn.Conv2d(P, L, kernel_size=(1, 1), stride=(1, 1), bias=False),
+            nn.ReLU(),
+        )
+
+    @staticmethod
+    def weights_init(m):
+        if type(m) == nn.Conv2d:
+            nn.init.kaiming_normal_(m.weight.data)
+
+    def forward(self, x):
+        abu_est1 = self.encoder(x)
+        cls_emb1 = self.vtrans(abu_est1)
+        cls_emb1 = cls_emb1.view(1, self.P, -1)
+        abu_est1 = self.upscale(cls_emb1).view(1, self.P, self.size, self.size)
+        abu_est1 = self.smooth(abu_est1)
+        re_result1 = self.decoder1(abu_est1)
+
+
+        abu_est2 = self.encoder(re_result1)
+        cls_emb2 = self.vtrans(abu_est2)
+        cls_emb2 = cls_emb2.view(1, self.P, -1)
+        abu_est2 = self.upscale(cls_emb2).view(1, self.P, self.size, self.size)
+        abu_est2 = self.smooth(abu_est2)
+        re_result2 = self.decoder2(abu_est2)
+        return abu_est1, re_result1,abu_est2, re_result2
+
+
+class NonZeroClipper(object):
+    def __call__(self, module):
+        if hasattr(module, 'weight'):
+            w = module.weight.data
+            w.clamp_(1e-6, 1)
+
+import torch.optim as optim
+
+class Train_test:
+    def __init__(self, dataset, device, skip_train=False, save=False):
+        super(Train_test, self).__init__()
+        self.skip_train = skip_train
+        self.device = device
+        self.dataset = dataset
+        self.save = save
+        self.save_dir = "trans_mod_" + dataset + "/"
+        os.makedirs(self.save_dir, exist_ok=True)
+        if dataset == 'samson':
+            self.P, self.L, self.col = 3, 156, 95
+            self.can=1
+            self.can1=0.1
+            self.beta2=0.2
+            self.beta3 = 0.5
+            self.alpha = 0.001
+            self.beta4=3e-2
+            self.LR, self.EPOCH = 8e-3, 200
+            self.patch, self.dim = 5, 200
+            self.beta, self.gamma = 5e3, 0.1#gamma=3e-2
+            self.weight_decay_param = 4e-5
+            self.order_abd, self.order_endmem = (0, 1, 2), (0, 1, 2)
+            self.data = dataset1.Data(dataset, device)
+            self.loader = self.data.get_loader(batch_size=self.col ** 2)
+            self.init_weight = self.data.get("init_weight").unsqueeze(2).unsqueeze(3).float()
+        elif dataset == 'apex':
+            self.P, self.L, self.col = 4, 285,110
+            self.LR, self.EPOCH = 6e-3, 200
+            self.patch, self.dim = 5, 200
+            self.beta2 = 0.3
+            self.beta3 = 0.4#0.4
+            self.alpha = 0.01
+            self.can = 1
+            self.can1=0.1
+            self.beta4 = 7e-1
+            self.beta, self.gamma = 5e3, 1
+            self.weight_decay_param = 4e-5
+            #self.order_abd, self.order_endmem = (3, 1, 2, 0), (3, 1, 2, 0)
+            self.order_abd, self.order_endmem = (0, 1, 2, 3), (0, 1, 2, 3)
+            self.data = dataset1.Data(dataset, device)
+            self.loader = self.data.get_loader(batch_size=self.col ** 2)
+            self.init_weight = self.data.get("init_weight").unsqueeze(2).unsqueeze(3).float()
+        elif dataset == 'dc':
+            self.P, self.L, self.col = 6, 191, 290
+            self.LR, self.EPOCH = 8e-3, 150
+            self.can = 0
+            self.can1=0.1
+            self.beta2 = 0.3
+            self.alpha = 0.05
+            self.beta3 = 0.3
+            self.beta4 = 4e-2
+            self.patch, self.dim = 10, 400
+            self.beta, self.gamma = 5e3, 4e-2
+            self.weight_decay_param = 2e-5
+            self.order_abd, self.order_endmem = (0, 2, 1, 5, 4, 3), (0, 2, 1, 5, 4, 3)
+            self.data = dataset1.Data(dataset, device)
+            self.loader = self.data.get_loader(batch_size=self.col ** 2)
+            self.init_weight = self.data.get("init_weight").unsqueeze(2).unsqueeze(3).float()
+        else:
+            raise ValueError("Unknown dataset")
+
+    def run(self, smry):
+        net = AutoEncoder(P=self.P, L=self.L, size=self.col,
+                          patch=self.patch, dim=self.dim).to(self.device)
+        if smry:
+            summary(net, (1, self.L, self.col, self.col), batch_dim=None)
+            return
+
+        net.apply(net.weights_init)
+
+        model_dict = net.state_dict()
+        model_dict['decoder1.0.weight'] = self.init_weight
+        model_dict['decoder2.0.weight'] = self.init_weight
+        net.load_state_dict(model_dict)
+        loss_func = nn.MSELoss(reduction='mean')
+        loss_func2 = utils.SAD(self.L)
+        optimizer = torch.optim.Adam(net.parameters(), lr=self.LR, weight_decay=self.weight_decay_param)
+
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=15, gamma=0.8)
+        apply_clamp_inst1 = NonZeroClipper()
+#添加开始
+        def my_loss(target, End2, lamb, out_):
+            loss1 = 0.5*torch.norm((out_.transpose(1,0).view(1,self.L,self.col,self.col) - target), 'fro')**2
+            O = torch.mean(target.view(self.L,self.col*self.col),1).type(dtype).view(self.L,1)
+            B = torch.from_numpy(np.identity(self.P)).type(dtype)
+            loss2 = torch.norm(torch.mm(End2,B.view((self.P,self.P)))-O, 'fro')**2
+            return loss1+lamb*loss2
+
+        if not self.skip_train:
+            time_start = time.time()
+            net.train()
+            epo_vs_los = []
+            for epoch in range(self.EPOCH):
+                for i, (x, _) in enumerate(self.loader):
+#x 1,156,95,95
+
+#The key code will be made public after being confirmed by the journal
+
+
+                    loss_Lsadsum = 0.5*loss_Lsad_2+0.5*loss_Lsad_1
+
+                    loss_sad = self.beta3 *loss_func2(re_result1.view(1, self.L, -1).transpose(1, 2),x.view(1, self.L, -1).transpose(1, 2))+(1-self.beta3) * loss_func2(re_result2.view(1, self.L, -1).transpose(1, 2),x.view(1, self.L, -1).transpose(1, 2))
+                    loss_sad = self.gamma * torch.sum(loss_sad).float()
+
+                    loss_re = self.beta2 * loss_func(re_result1, x)+(1-self.beta2) * loss_func(re_result2, x)
+                    loss_abu = self.beta4 * loss_func(abu_est1,abu_est2)
+
+                    loss_sim = self.can1*my_loss(img_noisy_torch,end5,100,re_result1)+self.can1*my_loss(img_noisy_torch,end5_2,100,re_result2)
+#self.alpha *loss_Lsadsum+
+
+                    total_loss =self.alpha*loss_Lsadsum+loss_abu+loss_sim+loss_sad+self.can*self.beta*loss_re
+
+
+#添加结束
+
+
+                    optimizer.zero_grad()
+                    total_loss.backward()
+                    nn.utils.clip_grad_norm_(net.parameters(), max_norm=10, norm_type=1)
+                    optimizer.step()
+                    with torch.no_grad():
+                        for name, param in net.named_parameters():
+                            if torch.isnan(param).any() or torch.isinf(param).any():
+                                print(f"Detected NaN or Inf values in {name} parameter.")
+
+                    net.decoder1.apply(apply_clamp_inst1)
+                    net.decoder2.apply(apply_clamp_inst1)
+                    if epoch % 10 == 0:
+                        print('Epoch:', epoch, '| train loss: %.4f' % total_loss.data,
+                         #     '| re loss: %.4f' % loss_re.data,
+                              '| sad loss: %.4f' % loss_sad.data)
+                    epo_vs_los.append(float(total_loss.data))
+
+                scheduler.step()
+            time_end = time.time()
+
+            if self.save:
+                with open(self.save_dir + 'weights_new.pickle', 'wb') as handle:
+                    pickle.dump(net.state_dict(), handle)
+                sio.savemat(self.save_dir + f"{self.dataset}_losses.mat", {"losses": epo_vs_los})
+
+            print('Total computational cost:', time_end - time_start)
+
+        else:
+            with open(self.save_dir + 'weights.pickle', 'rb') as handle:
+                net.load_state_dict(pickle.load(handle))
+
+        # Testing ================
+
+        net.eval()
+        x = self.data.get("hs_img").transpose(1, 0).view(1, -1, self.col, self.col)
+        abu_est1, re_result1,abu_est2, re_result2 = net(x)
+        abu_est1 = abu_est1 / (torch.sum(abu_est2, dim=1))
+        abu_est1 = abu_est1.squeeze(0).permute(1, 2, 0).detach().cpu().numpy()
+        target = torch.reshape(self.data.get("abd_map"), (self.col, self.col, self.P)).cpu().numpy()
+
+
+
+        est_endmem = net.state_dict()["decoder2.0.weight"].cpu().numpy()
+        est_endmem = est_endmem.reshape((self.L, self.P))
+
+        est_endmem = est_endmem[:, self.order_endmem]
+        abu_est1 = abu_est1[:, :, self.order_abd]
+        true_endmem = self.data.get("end_mem").numpy()
+        sio.savemat(self.save_dir + f"{self.dataset}_abd_map.mat", {"A_est": abu_est1})
+        sio.savemat(self.save_dir + f"{self.dataset}_endmem.mat", {"E_est": est_endmem})
+
+        x = x.view(-1, self.col, self.col).permute(1, 2, 0).detach().cpu().numpy()
+        re_result = re_result1.view(-1, self.col, self.col).permute(1, 2, 0).detach().cpu().numpy()
+        re = utils.compute_re(x, re_result)
+        print("RE:", re)
+
+        rmse_cls, mean_rmse = utils.compute_rmse(target, abu_est1)
+        print("Class-wise RMSE value:")
+        for i in range(self.P):
+            print("Class", i + 1, ":", rmse_cls[i])
+        print("Mean RMSE:", mean_rmse)
+
+
+        sad_cls, mean_sad = utils.compute_sad(est_endmem, true_endmem)
+        print("Class-wise SAD value:")
+        for i in range(self.P):
+            print("Class", i + 1, ":", sad_cls[i])
+        print("Mean SAD:", mean_sad)
+
+        with open(self.save_dir + "log1.csv", 'a') as file:
+            file.write(f"LR: {self.LR}, ")
+            file.write(f"WD: {self.weight_decay_param}, ")
+           # file.write(f"RE: {re:.4f}, ")
+            file.write(f"SAD: {mean_sad:.4f}, ")
+            file.write(f"RMSE: {mean_rmse:.4f}\n")
+
+        plots.plot_abundance(target, abu_est1, self.P, self.save_dir)
+        plots.plot_estimated_abundance(abu_est1, self.P, self.save_dir)
+
+        plots.plot_endmembers(true_endmem, est_endmem, self.P, self.save_dir)
+        
+# =================================================================
+
+if __name__ == '__main__':
+    pass
