@@ -100,7 +100,7 @@ class Train_test:
         if dataset == 'samson':
             self.P, self.L, self.col = 3, 156, 95
             self.can=1
-            self.can1=0.1
+            self.can1 = 0.1
             self.beta2=0.2
             self.beta3 = 0.5
             self.alpha = 0.001
@@ -146,6 +146,23 @@ class Train_test:
             self.data = dataset1.Data(dataset, device)
             self.loader = self.data.get_loader(batch_size=self.col ** 2)
             self.init_weight = self.data.get("init_weight").unsqueeze(2).unsqueeze(3).float()
+        elif dataset == 'jasper':
+            self.P, self.L, self.col = 4, 198, 100
+            self.can=1
+            self.can1 = 0.1
+            self.beta2=0.2
+            self.beta3 = 0.5
+            self.alpha = 0.001
+            self.beta4=3e-2
+            self.LR, self.EPOCH = 8e-3, 70
+            self.patch, self.dim = 5, 200
+            self.beta, self.gamma = 5e3, 0.1#gamma=3e-2
+            self.weight_decay_param = 1e-6
+            self.order_abd, self.order_endmem = (3, 1, 2, 0), (3, 1, 2, 0)
+            self.data = dataset1.Data(dataset, device)
+            self.loader = self.data.get_loader(batch_size=self.col ** 2)
+            self.init_weight = self.data.get("init_weight").unsqueeze(2).unsqueeze(3).float()
+
         else:
             raise ValueError("Unknown dataset")
 
@@ -184,8 +201,81 @@ class Train_test:
                 for i, (x, _) in enumerate(self.loader):
 #x 1,156,95,95
 
-#The key code will be made public after being confirmed by the journal
+                    x = x.transpose(1, 0).view(1, -1, self.col, self.col)
 
+                    abu_est1, re_result1,abu_est2, re_result2 = net(x)
+#
+#添加开始
+                    y_img_resh=torch.squeeze(x)
+                    y_img_resh=torch.reshape(y_img_resh,(self.L,self.col*self.col))
+                    V, SS, U = scipy.linalg.svd(y_img_resh, full_matrices=False)
+                    y_img_resh_DN=V[:,:self.P]@V[:,:self.P].transpose(1,0)@y_img_resh.detach().cpu().numpy()
+                    y_img_resh_np_clip=np.clip(y_img_resh_DN, 0, 1)
+                    II,III = utils.Endmember_extract(y_img_resh_np_clip, self.P)
+                    E_np1=y_img_resh_np_clip[:,II]
+                    E_torch = torch.from_numpy(E_np1).type(dtype)
+
+                    img_noisy_torch = torch.from_numpy(y_img_resh_DN).view(1,self.L,self.col,self.col).type(dtype)
+
+                    end5 = net.decoder1[0].weight
+                    end5 = end5.view(self.L, self.P)
+
+                    end7 = net.decoder1[0].weight.view(-1,self.L, self.P)
+                    end7_bar = end7.mean(dim=1, keepdim=True)
+#
+
+#
+                    end7_bar_norm = end7_bar.norm(dim=2, keepdim=True)
+                    end7_norm = end7.norm(dim=2, keepdim=True)
+                    for col in range(self.col):
+                        for row in range(self.col):
+                            current_abundance = abu_est1[:, :, row, col].view(1, 1, self.P)
+
+        # 在这里进行你的处理，使用 current_abundance 替代原来的 abundance_matrix
+
+        # 示例：计算 cos_theta，假设 end7_bar、end7、end7_bar_norm、end7_norm 已经定义
+                    abundance_weights = current_abundance.view(1, 1, self.P, 1, 1)
+                    abundance_weights_norm = abundance_weights.norm(dim=2, keepdim=True)# 添加维度以进行广播
+                    cos_theta = torch.sum(abundance_weights * end7, dim=2) / (abundance_weights_norm * end7_norm + 1e-6)
+                    cos_theta = torch.clamp(cos_theta, -1, 1)
+                    Lsad = torch.acos(cos_theta)
+                    loss_Lsad_1 = Lsad.sum()
+
+                    # cos_theta = torch.sum(end7_bar * end7, dim=2 ) / (end7_bar_norm*end7_norm +1e-6)
+                    # cos_theta = torch.clamp(cos_theta, -1, 1)
+                    # Lsad = torch.acos(cos_theta)
+                    # loss_Lsad_1 = Lsad.sum()
+#/ (self.P * end7.size(0))
+
+                    end5_2 = net.decoder2[0].weight
+                    end5_2 = end5_2.view(self.L, self.P)
+
+                    end7_2 = net.decoder2[0].weight.view(-1,self.L, self.P)
+
+
+
+                    end7_2_bar = end7_2.mean(dim=1, keepdim=True)
+                    end7_2_bar_norm = end7_2_bar.norm(dim=2, keepdim=True)
+                    end7_2_norm = end7_2.norm(dim=2, keepdim=True)
+                    for col in range(self.col):
+                        for row in range(self.col):
+                            current_abundance = abu_est2[:, :, row, col].view(1, 1, self.P)
+
+        # 在这里进行你的处理，使用 current_abundance 替代原来的 abundance_matrix
+
+        # 示例：计算 cos_theta，假设 end7_bar、end7、end7_bar_norm、end7_norm 已经定义
+                            abundance_weights = current_abundance.view(1, 1, self.P, 1, 1)
+                            abundance_weights_norm = abundance_weights.norm(dim=2, keepdim=True)# 添加维度以进行广播
+                            cos_theta_2 = torch.sum(abundance_weights * end7_2, dim=2) / (abundance_weights_norm * end7_2_norm + 1e-6)
+                            cos_theta_2 = torch.clamp(cos_theta_2, -1, 1)
+                            Lsad_2 = torch.acos(cos_theta_2)
+                            loss_Lsad_2 = Lsad_2.sum()
+
+                    #
+                    # cos_theta_2 = torch.sum(end7_2_bar * end7_2, dim=2) /(end7_2_bar_norm*end7_2_norm +1e-6)
+                    # cos_theta_2 = torch.clamp(cos_theta_2, -1, 1)
+                    # Lsad_2= torch.acos(cos_theta_2)
+                    # loss_Lsad_2 = Lsad_2.sum()
 
                     loss_Lsadsum = 0.5*loss_Lsad_2+0.5*loss_Lsad_1
 
@@ -197,10 +287,14 @@ class Train_test:
 
                     loss_sim = self.can1*my_loss(img_noisy_torch,end5,100,re_result1)+self.can1*my_loss(img_noisy_torch,end5_2,100,re_result2)
 #self.alpha *loss_Lsadsum+
-
+#原损失
                     total_loss =self.alpha*loss_Lsadsum+loss_abu+loss_sim+loss_sad+self.can*self.beta*loss_re
-
-
+#不加最小加端元
+                    #total_loss =self.alpha*loss_Lsadsum+loss_abu+loss_sad+self.can*self.beta*loss_re
+#不加端元优化加最小
+                    #total_loss =loss_abu+loss_sad+self.can*self.beta*loss_re+loss_sim
+#两个都不加
+                    #total_loss = loss_abu + loss_sad + self.can * self.beta * loss_re
 #添加结束
 
 
